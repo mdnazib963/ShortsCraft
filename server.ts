@@ -73,6 +73,12 @@ async function startServer() {
       await page.setViewport({ width: 1280, height: 720 });
       await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36');
 
+      // Helper to check for watermarks in URL or content
+      const isWatermarked = (url: string) => {
+        const forbidden = ['shutterstock', 'envato', 'adobe', 'istock', 'getty', 'pond5', 'depositphotos', 'dreamstime', '123rf', 'canva'];
+        return forbidden.some(word => url.toLowerCase().includes(word));
+      };
+
       // Helper to try Pexels
       const tryPexels = async (searchTerm: string) => {
         console.log(`[Pexels] Trying: ${searchTerm}`);
@@ -82,7 +88,7 @@ async function startServer() {
         pexelsPage.on('response', (response) => {
           const url = response.url();
           const contentType = response.headers()['content-type'] || '';
-          if ((contentType.includes('video') || url.endsWith('.mp4')) && !url.includes('preview') && !url.includes('tiny')) {
+          if ((contentType.includes('video') || url.endsWith('.mp4')) && !url.includes('preview') && !url.includes('tiny') && !isWatermarked(url)) {
             collectedVideos.add(url);
           }
         });
@@ -126,6 +132,8 @@ async function startServer() {
           });
 
           for (const pinUrl of pinLinks.slice(0, 5)) {
+            if (isWatermarked(pinUrl)) continue; // Skip watermarked pins
+            
             const detailPage = await browser.newPage();
             try {
               await detailPage.goto(pinUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
@@ -135,6 +143,8 @@ async function startServer() {
 
               if (matches && matches.length > 0) {
                 let rawUrl = matches[0].replace(/\\u002F/g, '/');
+                if (isWatermarked(rawUrl)) continue;
+
                 const hashMatch = rawUrl.match(/([a-f0-9]{32})/);
                 if (hashMatch) {
                   const fullHash = hashMatch[1];
@@ -172,6 +182,8 @@ async function startServer() {
           });
 
           for (const videoPageUrl of videoLinks.slice(0, 3)) {
+            if (isWatermarked(videoPageUrl)) continue;
+
             const detailPage = await browser.newPage();
             try {
               await detailPage.goto(videoPageUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
@@ -179,7 +191,7 @@ async function startServer() {
                 const video = document.querySelector('video source');
                 return video ? (video as HTMLSourceElement).src : null;
               });
-              if (videoSrc) {
+              if (videoSrc && !isWatermarked(videoSrc)) {
                 await detailPage.close();
                 return videoSrc;
               }
@@ -210,19 +222,20 @@ async function startServer() {
             return video ? video.src : null;
           });
 
-          if (videoSrc) return videoSrc;
+          if (videoSrc && !isWatermarked(videoSrc)) return videoSrc;
 
           const firstVideoLink = await mixkitPage.evaluate(() => {
             const link = document.querySelector('a[href*="/free-stock-video/"]');
             return link ? (link as HTMLAnchorElement).href : null;
           });
 
-          if (firstVideoLink) {
+          if (firstVideoLink && !isWatermarked(firstVideoLink)) {
             await mixkitPage.goto(firstVideoLink, { waitUntil: 'domcontentloaded' });
-            return await mixkitPage.evaluate(() => {
+            const finalSrc = await mixkitPage.evaluate(() => {
               const video = document.querySelector('video');
               return video ? video.src : null;
             });
+            if (finalSrc && !isWatermarked(finalSrc)) return finalSrc;
           }
         } catch (e) {
           console.log(`[Mixkit] Search fail for ${searchTerm}`);
