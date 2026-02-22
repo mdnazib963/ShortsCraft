@@ -23,13 +23,14 @@ import {
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { cn } from './lib/utils';
-import { generateShortScript, generateSceneVideo, mergeVideos, verifyVideo } from './services/videoService';
+import { generateShortScript, generateSceneVideo, mergeVideos, verifyVideo, generateAudio } from './services/videoService';
 
 interface Scene {
   imagePrompt: string;
   narration: string;
   overlayText: string;
   videoUrl?: string;
+  audioUrl?: string;
 }
 
 interface ShortProject {
@@ -52,6 +53,16 @@ export default function App() {
   const [isEditingKeywords, setIsEditingKeywords] = useState(false);
   const [editingKeywords, setEditingKeywords] = useState('');
   const videoRef = useRef<HTMLVideoElement>(null);
+  const audioRef = useRef<HTMLAudioElement>(null);
+
+  useEffect(() => {
+    if (currentShort && currentShort.scenes[activeSceneIndex]?.audioUrl && !finalVideoUrl) {
+      if (audioRef.current) {
+        audioRef.current.src = currentShort.scenes[activeSceneIndex].audioUrl!;
+        audioRef.current.play().catch(e => console.log("Audio play blocked", e));
+      }
+    }
+  }, [activeSceneIndex, currentShort, finalVideoUrl]);
 
   const handleGenerate = async () => {
     if (!prompt.trim()) return;
@@ -73,38 +84,43 @@ export default function App() {
       setCurrentShort(newShort);
       setActiveSceneIndex(0);
 
-      // Generate videos for each scene
+      // Generate videos and audio for each scene
       const updatedScenes = [...newShort.scenes];
       for (let i = 0; i < updatedScenes.length; i++) {
-        setStatusMessage(`Extracting video ${i + 1} of ${updatedScenes.length}...`);
+        setStatusMessage(`Generating audio and video ${i + 1} of ${updatedScenes.length}...`);
+        
+        if (i > 0) await new Promise(r => setTimeout(r, 5000)); // Increased delay to 5s
+        
+        // Generate Audio in parallel with video search
+        const audioPromise = generateAudio(updatedScenes[i].narration);
         
         let foundValidVideo = false;
         let attempts = 0;
-        const maxAttempts = 2; // Try up to 2 times with different variations in backend
+        const maxAttempts = 2;
 
         while (!foundValidVideo && attempts < maxAttempts) {
           attempts++;
           try {
-            // Add a small delay between scene requests to prevent backend overload
-            if (i > 0 || attempts > 1) await new Promise(r => setTimeout(r, 2000));
+            if (attempts > 1) await new Promise(r => setTimeout(r, 3000));
             
             const videoUrl = await generateSceneVideo(updatedScenes[i].imagePrompt);
             if (videoUrl) {
-              // Verify immediately
               const isValid = await verifyVideo(videoUrl);
               if (isValid) {
                 updatedScenes[i].videoUrl = videoUrl;
                 foundValidVideo = true;
-                // Update UI incrementally
-                setCurrentShort(prev => prev ? { ...prev, scenes: [...updatedScenes] } : null);
-              } else {
-                console.log(`[App] Scene ${i+1} found invalid video, retrying...`);
               }
             }
           } catch (err) {
             console.error(`Failed to generate video for scene ${i}:`, err);
           }
         }
+
+        const audioUrl = await audioPromise;
+        if (audioUrl) updatedScenes[i].audioUrl = audioUrl;
+
+        // Update UI incrementally
+        setCurrentShort(prev => prev ? { ...prev, scenes: [...updatedScenes] } : null);
       }
 
       setHistory(prev => [newShort, ...prev]);
@@ -121,14 +137,18 @@ export default function App() {
     if (!currentShort) return;
     
     const updatedScenes = [...currentShort.scenes];
-    setStatusMessage(`Regenerating video for scene ${index + 1}...`);
+    setStatusMessage(`Regenerating scene ${index + 1}...`);
     
     try {
-      const videoUrl = await generateSceneVideo(updatedScenes[index].imagePrompt);
-      if (videoUrl) {
-        updatedScenes[index].videoUrl = videoUrl;
-        setCurrentShort({ ...currentShort, scenes: updatedScenes });
-      }
+      const [videoUrl, audioUrl] = await Promise.all([
+        generateSceneVideo(updatedScenes[index].imagePrompt),
+        generateAudio(updatedScenes[index].narration)
+      ]);
+
+      if (videoUrl) updatedScenes[index].videoUrl = videoUrl;
+      if (audioUrl) updatedScenes[index].audioUrl = audioUrl;
+      
+      setCurrentShort({ ...currentShort, scenes: updatedScenes });
     } catch (err) {
       console.error("Regeneration failed:", err);
     } finally {
@@ -182,16 +202,17 @@ export default function App() {
       }
 
       const finalUrls = updatedScenes.map(s => s.videoUrl).filter(Boolean) as string[];
+      const finalAudioUrls = updatedScenes.map(s => s.audioUrl).filter(Boolean) as string[];
       
-      if (finalUrls.length === 0) {
-        alert("No valid videos could be found. Please try a different topic or regenerate individual scenes.");
+      if (finalUrls.length === 0 || finalAudioUrls.length === 0) {
+        alert("No valid videos or audio could be found. Please try a different topic or regenerate individual scenes.");
         setIsMerging(false);
         setStatusMessage('');
         return;
       }
 
-      if (finalUrls.length < updatedScenes.length) {
-        const proceed = confirm(`Warning: Only ${finalUrls.length} of ${updatedScenes.length} clips are valid. The final video will be missing parts. Proceed anyway?`);
+      if (finalUrls.length < updatedScenes.length || finalAudioUrls.length < updatedScenes.length) {
+        const proceed = confirm(`Warning: Some clips or audio are missing. The final video will be incomplete. Proceed anyway?`);
         if (!proceed) {
           setIsMerging(false);
           setStatusMessage('');
@@ -201,7 +222,7 @@ export default function App() {
 
       // 2. Proceed to Merge
       setStatusMessage('Merging verified scenes into final short...');
-      const mergedUrl = await mergeVideos(finalUrls);
+      const mergedUrl = await mergeVideos(finalUrls, finalAudioUrls);
       if (mergedUrl) {
         const updatedProject = { ...currentShort, finalVideoUrl: mergedUrl };
         setCurrentShort(updatedProject);
@@ -381,6 +402,9 @@ export default function App() {
                     <RefreshCcw size={18} />
                   </button>
                 </div>
+
+                {/* Hidden Audio Element */}
+                <audio ref={audioRef} />
 
                 {currentShort.scenes[activeSceneIndex]?.videoUrl ? (
                   <video 

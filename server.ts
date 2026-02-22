@@ -6,6 +6,7 @@ import { fileURLToPath } from "url";
 import fs from "fs";
 import ffmpeg from "fluent-ffmpeg";
 import ffmpegInstaller from "@ffmpeg-installer/ffmpeg";
+import ffprobeInstaller from "@ffprobe-installer/ffprobe";
 import axios from "axios";
 import { v4 as uuidv4 } from "uuid";
 
@@ -13,6 +14,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 ffmpeg.setFfmpegPath(ffmpegInstaller.path);
+ffmpeg.setFfprobePath(ffprobeInstaller.path);
 
 const TEMP_DIR = path.join(__dirname, "temp");
 if (!fs.existsSync(TEMP_DIR)) {
@@ -79,6 +81,101 @@ async function startServer() {
         return forbidden.some(word => url.toLowerCase().includes(word));
       };
 
+      // Helper to try Coverr.co (Scraping)
+      const tryCoverr = async (searchTerm: string) => {
+        console.log(`[Coverr] Trying: ${searchTerm}`);
+        const coverrPage = await browser.newPage();
+        try {
+          const url = `https://coverr.co/s?q=${encodeURIComponent(searchTerm)}`;
+          await coverrPage.goto(url, { waitUntil: "networkidle2", timeout: 25000 });
+          
+          const videoLinks = await coverrPage.evaluate(() => {
+            const anchors = Array.from(document.querySelectorAll('a[href*="/videos/"]'));
+            return anchors.map(a => (a as HTMLAnchorElement).href).filter(href => href.includes('/videos/'));
+          });
+
+          if (videoLinks.length > 0) {
+            const randomLinks = videoLinks.sort(() => 0.5 - Math.random()).slice(0, 3);
+            for (const link of randomLinks) {
+              await coverrPage.goto(link, { waitUntil: 'domcontentloaded' });
+              const videoSrc = await coverrPage.evaluate(() => {
+                const video = document.querySelector('video');
+                return video ? video.src : null;
+              });
+              if (videoSrc && !isWatermarked(videoSrc)) return videoSrc;
+            }
+          }
+        } catch (e) {
+          console.log(`[Coverr] Search fail for ${searchTerm}`);
+        } finally {
+          await coverrPage.close();
+        }
+        return null;
+      };
+
+      // Helper to try Videvo.net (Scraping)
+      const tryVidevo = async (searchTerm: string) => {
+        console.log(`[Videvo] Trying: ${searchTerm}`);
+        const videvoPage = await browser.newPage();
+        try {
+          const url = `https://www.videvo.net/search/${encodeURIComponent(searchTerm)}/`;
+          await videvoPage.goto(url, { waitUntil: "networkidle2", timeout: 25000 });
+          
+          const videoSrcs = await videvoPage.evaluate(() => {
+            const videos = Array.from(document.querySelectorAll('video'));
+            return videos.map(v => v.src).filter(src => src && src.length > 0);
+          });
+
+          if (videoSrcs.length > 0) {
+            // Prioritize non-preview and non-small links
+            const validSrcs = videoSrcs.filter(src => !isWatermarked(src) && !src.includes('preview') && !src.includes('small'));
+            const fallbackSrcs = videoSrcs.filter(src => !isWatermarked(src));
+            
+            const bestSrcs = validSrcs.length > 0 ? validSrcs : fallbackSrcs;
+            if (bestSrcs.length > 0) {
+              return bestSrcs[Math.floor(Math.random() * bestSrcs.length)];
+            }
+          }
+        } catch (e) {
+          console.log(`[Videvo] Search fail for ${searchTerm}`);
+        } finally {
+          await videvoPage.close();
+        }
+        return null;
+      };
+
+      // Helper to try Vidsplay.com (Scraping)
+      const tryVidsplay = async (searchTerm: string) => {
+        console.log(`[Vidsplay] Trying: ${searchTerm}`);
+        const vidsplayPage = await browser.newPage();
+        try {
+          const url = `https://www.vidsplay.com/?s=${encodeURIComponent(searchTerm)}`;
+          await vidsplayPage.goto(url, { waitUntil: "networkidle2", timeout: 25000 });
+          
+          const videoLinks = await vidsplayPage.evaluate(() => {
+            const links = Array.from(document.querySelectorAll('a[href*="/free-stock-video/"]'));
+            return links.map(l => (l as HTMLAnchorElement).href);
+          });
+
+          if (videoLinks.length > 0) {
+            const randomLinks = videoLinks.sort(() => 0.5 - Math.random()).slice(0, 2);
+            for (const link of randomLinks) {
+              await vidsplayPage.goto(link, { waitUntil: 'domcontentloaded' });
+              const videoSrc = await vidsplayPage.evaluate(() => {
+                const video = document.querySelector('video source');
+                return video ? (video as HTMLSourceElement).src : null;
+              });
+              if (videoSrc && !isWatermarked(videoSrc)) return videoSrc;
+            }
+          }
+        } catch (e) {
+          console.log(`[Vidsplay] Search fail for ${searchTerm}`);
+        } finally {
+          await vidsplayPage.close();
+        }
+        return null;
+      };
+
       // Helper to try Pexels
       const tryPexels = async (searchTerm: string) => {
         console.log(`[Pexels] Trying: ${searchTerm}`);
@@ -88,82 +185,52 @@ async function startServer() {
         pexelsPage.on('response', (response) => {
           const url = response.url();
           const contentType = response.headers()['content-type'] || '';
-          if ((contentType.includes('video') || url.endsWith('.mp4')) && !url.includes('preview') && !url.includes('tiny') && !isWatermarked(url)) {
+          if ((contentType.includes('video') || url.endsWith('.mp4')) && 
+              !url.includes('preview') && !url.includes('tiny') && 
+              !url.includes('small') && !isWatermarked(url)) {
             collectedVideos.add(url);
           }
         });
 
         try {
           const url = `https://www.pexels.com/search/video/${encodeURIComponent(searchTerm)}/?orientation=portrait`;
-          await pexelsPage.goto(url, { waitUntil: "networkidle2", timeout: 25000 });
+          await pexelsPage.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
           
+          // Wait for either the article or a common "no results" or "blocked" indicator
+          try {
+            await pexelsPage.waitForSelector('article a[href*="/video/"]', { timeout: 15000 });
+          } catch (e) {
+            // If selector fails, try to scroll a bit to trigger lazy loading
+            await pexelsPage.evaluate(() => window.scrollBy(0, 500));
+            await new Promise(r => setTimeout(r, 2000));
+          }
+
           const selector = 'article a[href*="/video/"]';
-          await pexelsPage.waitForSelector(selector, { timeout: 10000 });
           const videoCards = await pexelsPage.$$(selector);
           
-          for (let i = 0; i < Math.min(videoCards.length, 10); i++) {
-            await videoCards[i].hover();
-            await new Promise(r => setTimeout(r, 1200));
-            if (collectedVideos.size > 0) break;
+          if (videoCards.length === 0) {
+            console.log(`[Pexels] No video cards found for ${searchTerm}`);
+            return null;
+          }
+
+          // Hover over more cards to collect more options
+          const indices = Array.from({length: Math.min(videoCards.length, 10)}, (_, i) => i).sort(() => 0.5 - Math.random());
+          for (const i of indices) {
+            try {
+              await videoCards[i].hover();
+              await new Promise(r => setTimeout(r, 1000));
+            } catch (err) {}
+            if (collectedVideos.size >= 3) break; 
           }
 
           if (collectedVideos.size > 0) {
-            return Array.from(collectedVideos)[0];
+            const videos = Array.from(collectedVideos);
+            return videos[Math.floor(Math.random() * videos.length)];
           }
-        } catch (e) {
-          console.log(`[Pexels] Failed for ${searchTerm}`);
+        } catch (e: any) {
+          console.log(`[Pexels] Failed for ${searchTerm}: ${e.message}`);
         } finally {
           await pexelsPage.close();
-        }
-        return null;
-      };
-
-      // Helper to try Pinterest
-      const tryPinterest = async (searchTerm: string) => {
-        console.log(`[Pinterest] Trying: ${searchTerm}`);
-        const pinPage = await browser.newPage();
-        try {
-          const url = `https://www.pinterest.com/search/pins/?q=${encodeURIComponent(searchTerm + " vertical video")}&rs=typed`;
-          await pinPage.goto(url, { waitUntil: 'networkidle2', timeout: 25000 });
-
-          const pinLinks = await pinPage.evaluate(() => {
-            const anchors = Array.from(document.querySelectorAll('div[data-test-id="pinWrapper"] a'));
-            return anchors.map(a => (a as HTMLAnchorElement).href).filter(href => href.includes('/pin/'));
-          });
-
-          for (const pinUrl of pinLinks.slice(0, 5)) {
-            if (isWatermarked(pinUrl)) continue; // Skip watermarked pins
-            
-            const detailPage = await browser.newPage();
-            try {
-              await detailPage.goto(pinUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
-              const htmlContent = await detailPage.content();
-              const videoUrlPattern = /https:\/\/v1\.pinimg\.com\/videos\/mc\/[^\s"']+/g;
-              const matches = htmlContent.match(videoUrlPattern);
-
-              if (matches && matches.length > 0) {
-                let rawUrl = matches[0].replace(/\\u002F/g, '/');
-                if (isWatermarked(rawUrl)) continue;
-
-                const hashMatch = rawUrl.match(/([a-f0-9]{32})/);
-                if (hashMatch) {
-                  const fullHash = hashMatch[1];
-                  const [h1, h2, h3] = [fullHash.substring(0, 2), fullHash.substring(2, 4), fullHash.substring(4, 6)];
-                  const directUrl = `https://v1.pinimg.com/videos/mc/720p/${h1}/${h2}/${h3}/${fullHash}.mp4`;
-                  await detailPage.close();
-                  return directUrl;
-                }
-              }
-            } catch (err) {
-              console.log(`[Pinterest] Detail fail: ${pinUrl}`);
-            } finally {
-              if (!detailPage.isClosed()) await detailPage.close();
-            }
-          }
-        } catch (e) {
-          console.log(`[Pinterest] Search fail for ${searchTerm}`);
-        } finally {
-          await pinPage.close();
         }
         return null;
       };
@@ -181,24 +248,27 @@ async function startServer() {
             return anchors.map(a => (a as HTMLAnchorElement).href).filter(href => /\/videos\/[a-z0-9-]+\d+\/$/.test(href));
           });
 
-          for (const videoPageUrl of videoLinks.slice(0, 3)) {
-            if (isWatermarked(videoPageUrl)) continue;
+          if (videoLinks.length > 0) {
+            const randomLinks = videoLinks.sort(() => 0.5 - Math.random()).slice(0, 3);
+            for (const videoPageUrl of randomLinks) {
+              if (isWatermarked(videoPageUrl)) continue;
 
-            const detailPage = await browser.newPage();
-            try {
-              await detailPage.goto(videoPageUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
-              const videoSrc = await detailPage.evaluate(() => {
-                const video = document.querySelector('video source');
-                return video ? (video as HTMLSourceElement).src : null;
-              });
-              if (videoSrc && !isWatermarked(videoSrc)) {
-                await detailPage.close();
-                return videoSrc;
+              const detailPage = await browser.newPage();
+              try {
+                await detailPage.goto(videoPageUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+                const videoSrc = await detailPage.evaluate(() => {
+                  const video = document.querySelector('video source');
+                  return video ? (video as HTMLSourceElement).src : null;
+                });
+                if (videoSrc && !isWatermarked(videoSrc)) {
+                  await detailPage.close();
+                  return videoSrc;
+                }
+              } catch (err) {
+                console.log(`[Pixabay] Detail fail: ${videoPageUrl}`);
+              } finally {
+                if (!detailPage.isClosed()) await detailPage.close();
               }
-            } catch (err) {
-              console.log(`[Pixabay] Detail fail: ${videoPageUrl}`);
-            } finally {
-              if (!detailPage.isClosed()) await detailPage.close();
             }
           }
         } catch (e) {
@@ -217,25 +287,31 @@ async function startServer() {
           const url = `https://mixkit.co/free-stock-video/${encodeURIComponent(searchTerm)}/`;
           await mixkitPage.goto(url, { waitUntil: "networkidle2", timeout: 25000 });
           
-          const videoSrc = await mixkitPage.evaluate(() => {
-            const video = document.querySelector('video');
-            return video ? video.src : null;
+          const videoLinks = await mixkitPage.evaluate(() => {
+            const anchors = Array.from(document.querySelectorAll('a[href*="/free-stock-video/"]'));
+            return anchors.map(a => (a as HTMLAnchorElement).href).filter(href => href.includes('/free-stock-video/'));
           });
 
-          if (videoSrc && !isWatermarked(videoSrc)) return videoSrc;
-
-          const firstVideoLink = await mixkitPage.evaluate(() => {
-            const link = document.querySelector('a[href*="/free-stock-video/"]');
-            return link ? (link as HTMLAnchorElement).href : null;
-          });
-
-          if (firstVideoLink && !isWatermarked(firstVideoLink)) {
-            await mixkitPage.goto(firstVideoLink, { waitUntil: 'domcontentloaded' });
-            const finalSrc = await mixkitPage.evaluate(() => {
-              const video = document.querySelector('video');
-              return video ? video.src : null;
-            });
-            if (finalSrc && !isWatermarked(finalSrc)) return finalSrc;
+          if (videoLinks.length > 0) {
+            const randomLinks = videoLinks.sort(() => 0.5 - Math.random()).slice(0, 3);
+            for (const link of randomLinks) {
+              const detailPage = await browser.newPage();
+              try {
+                await detailPage.goto(link, { waitUntil: 'domcontentloaded', timeout: 15000 });
+                const videoSrc = await detailPage.evaluate(() => {
+                  const video = document.querySelector('video');
+                  return video ? video.src : null;
+                });
+                if (videoSrc && !isWatermarked(videoSrc)) {
+                  await detailPage.close();
+                  return videoSrc;
+                }
+              } catch (err) {
+                console.log(`[Mixkit] Detail fail: ${link}`);
+              } finally {
+                if (!detailPage.isClosed()) await detailPage.close();
+              }
+            }
           }
         } catch (e) {
           console.log(`[Mixkit] Search fail for ${searchTerm}`);
@@ -245,32 +321,139 @@ async function startServer() {
         return null;
       };
 
-      // Execution Strategy: Try multiple sources with keyword variations
+      // Helper to try MotionElements (Scraping)
+      const tryMotionElements = async (searchTerm: string) => {
+        console.log(`[MotionElements] Trying: ${searchTerm}`);
+        const mePage = await browser.newPage();
+        try {
+          const url = `https://www.motionelements.com/search/video?q=${encodeURIComponent(searchTerm)}&sort=relevance`;
+          await mePage.goto(url, { waitUntil: "networkidle2", timeout: 25000 });
+          
+          const videoSrcs = await mePage.evaluate(() => {
+            const videos = Array.from(document.querySelectorAll('video source'));
+            return videos.map(v => (v as HTMLSourceElement).src).filter(src => src && src.length > 0);
+          });
+
+          if (videoSrcs.length > 0) {
+            const validSrcs = videoSrcs.filter(src => !isWatermarked(src));
+            if (validSrcs.length > 0) {
+              return validSrcs[Math.floor(Math.random() * Math.min(validSrcs.length, 3))];
+            }
+          }
+        } catch (e) {
+          console.log(`[MotionElements] Search fail for ${searchTerm}`);
+        } finally {
+          await mePage.close();
+        }
+        return null;
+      };
+
+      // Helper to try SplitShire (Scraping)
+      const trySplitShire = async (searchTerm: string) => {
+        console.log(`[SplitShire] Trying: ${searchTerm}`);
+        const ssPage = await browser.newPage();
+        try {
+          const url = `https://www.splitshire.com/?s=${encodeURIComponent(searchTerm)}`;
+          await ssPage.goto(url, { waitUntil: "networkidle2", timeout: 25000 });
+          
+          const videoLinks = await ssPage.evaluate(() => {
+            const anchors = Array.from(document.querySelectorAll('a[href*="/video/"]'));
+            return anchors.map(a => (a as HTMLAnchorElement).href);
+          });
+
+          if (videoLinks.length > 0) {
+            const link = videoLinks[0];
+            await ssPage.goto(link, { waitUntil: 'domcontentloaded' });
+            const videoSrc = await ssPage.evaluate(() => {
+              const video = document.querySelector('video source');
+              return video ? (video as HTMLSourceElement).src : null;
+            });
+            if (videoSrc && !isWatermarked(videoSrc)) return videoSrc;
+          }
+        } catch (e) {
+          console.log(`[SplitShire] Search fail for ${searchTerm}`);
+        } finally {
+          await ssPage.close();
+        }
+        return null;
+      };
+
+      // Helper to try Reddit (Scraping)
+      const tryReddit = async (searchTerm: string) => {
+        console.log(`[Reddit] Trying: ${searchTerm}`);
+        const redditPage = await browser.newPage();
+        try {
+          const url = `https://www.reddit.com/search/?q=${encodeURIComponent(searchTerm)}&type=link`;
+          await redditPage.goto(url, { waitUntil: "networkidle2", timeout: 25000 });
+          
+          const videoLinks = await redditPage.evaluate(() => {
+            const anchors = Array.from(document.querySelectorAll('a[href*="v.redd.it"], a[href*="reddit.com/r/"]'));
+            return anchors.map(a => (a as HTMLAnchorElement).href).filter(href => href.includes('v.redd.it') || href.includes('/comments/'));
+          });
+
+          if (videoLinks.length > 0) {
+            // Reddit is tricky, we'll just try to find a direct video link if possible
+            // This is a placeholder as Reddit videos usually need a downloader
+            // But sometimes they are embedded
+            return null; // Reddit is too complex for a simple scraper, skipping for now but acknowledged
+          }
+        } catch (e) {
+          console.log(`[Reddit] Search fail for ${searchTerm}`);
+        } finally {
+          await redditPage.close();
+        }
+        return null;
+      };
+
+      // Execution Strategy: Parallel search across multiple sources
       const variations = [
         query,
-        query.split(' ').slice(-2).join(' '), // Last 2 words
-        query.split(' ')[0] + " vertical",     // First word + vertical
-        "aesthetic " + query.split(' ')[0],    // aesthetic + first word
+        query + " cinematic",
+        query.split(' ').slice(0, 2).join(' '), // Simpler variation
       ];
 
       for (const term of variations) {
         if (!term) continue;
-        console.log(`[Search] Attempting variation: "${term}"`);
+        console.log(`[Search] Attempting parallel search for: "${term}"`);
         
-        let url = await tryPexels(term);
-        if (!url) url = await tryPinterest(term);
-        if (!url) url = await tryPixabay(term);
-        if (!url) url = await tryMixkit(term);
+        const sources = [
+          tryPexels(term),
+          tryCoverr(term),
+          tryVidevo(term),
+          tryPixabay(term),
+          tryMixkit(term),
+          tryVidsplay(term),
+          tryMotionElements(term),
+          trySplitShire(term),
+          tryReddit(term)
+        ];
+
+        // Use Promise.all and filter for the first non-null result
+        // This is "parallel" but we still want to be efficient
+        const results = await Promise.all(sources);
+        const validUrl = results.find(url => url !== null);
         
-        if (url) {
-          console.log(`[Search] Success! Found: ${url}`);
-          return res.json({ url });
+        if (validUrl) {
+          console.log(`[Search] Success! Found: ${validUrl}`);
+          return res.json({ url: validUrl });
         }
       }
 
-      // Final Fallback (High Quality Stock Video)
+      // Final Fallback (Randomized high quality stock videos to avoid 'same clip' issue)
+      const fallbacks = [
+        "https://player.vimeo.com/external/434045526.sd.mp4?s=c27dbed29f271206012137c745301a62459ed6e7&profile_id=165&oauth2_token_id=57447761",
+        "https://player.vimeo.com/external/403846614.sd.mp4?s=34f97157833290659639537f7175402636a0d494&profile_id=165&oauth2_token_id=57447761",
+        "https://player.vimeo.com/external/394740316.sd.mp4?s=434449f0185c4929881f6d862e3647d9d8e95241&profile_id=165&oauth2_token_id=57447761",
+        "https://player.vimeo.com/external/449074011.sd.mp4?s=53946603b494277c0018ef9a2d3c144445b28a59&profile_id=165&oauth2_token_id=57447761",
+        "https://player.vimeo.com/external/494252666.sd.mp4?s=72771929239738fc033c876010b417b16ba9220a&profile_id=165&oauth2_token_id=57447761",
+        "https://player.vimeo.com/external/459389137.sd.mp4?s=96445f6d230114f7768391811176dd921757f94a&profile_id=165&oauth2_token_id=57447761",
+        "https://player.vimeo.com/external/418306352.sd.mp4?s=53946603b494277c0018ef9a2d3c144445b28a59&profile_id=165&oauth2_token_id=57447761",
+        "https://player.vimeo.com/external/371433846.sd.mp4?s=236da2f3c05d00db97ee90743530f769274943c3&profile_id=165&oauth2_token_id=57447761"
+      ];
+      const randomFallback = fallbacks[Math.floor(Math.random() * fallbacks.length)];
+      
       console.log(`[Search] All sources failed. Using fallback.`);
-      res.json({ url: "https://player.vimeo.com/external/434045526.sd.mp4?s=c27dbed29f271206012137c745301a62459ed6e7&profile_id=165&oauth2_token_id=57447761" });
+      res.json({ url: randomFallback });
     } catch (error: any) {
       console.error("[Search] Critical Puppeteer error:", error);
       res.json({ url: "https://player.vimeo.com/external/434045526.sd.mp4?s=c27dbed29f271206012137c745301a62459ed6e7&profile_id=165&oauth2_token_id=57447761" });
@@ -279,11 +462,14 @@ async function startServer() {
     }
   });
 
-  // API Route to merge videos
+  // API Route to merge videos and audios with duration syncing
   app.post("/api/merge-videos", async (req, res) => {
-    const { videoUrls } = req.body;
+    const { videoUrls, audioUrls } = req.body;
     if (!videoUrls || !Array.isArray(videoUrls) || videoUrls.length === 0) {
       return res.status(400).json({ error: "videoUrls array required" });
+    }
+    if (!audioUrls || !Array.isArray(audioUrls) || audioUrls.length !== videoUrls.length) {
+      return res.status(400).json({ error: "Matching audioUrls array required" });
     }
 
     const jobId = uuidv4();
@@ -291,105 +477,81 @@ async function startServer() {
     fs.mkdirSync(jobDir);
 
     try {
-      console.log(`[Merge] Starting job: ${jobId} with ${videoUrls.length} videos`);
-      const localPaths: string[] = [];
-      const normalizedPaths: string[] = [];
+      console.log(`[Merge] Starting job: ${jobId} with ${videoUrls.length} scenes`);
+      const scenePaths: string[] = [];
 
-      // 1. Download all videos with User-Agent and Retry Logic
       for (let i = 0; i < videoUrls.length; i++) {
         const videoUrl = videoUrls[i];
-        const localPath = path.join(jobDir, `raw_${i}.mp4`);
-        
-        let downloaded = false;
-        let attempts = 0;
-        const maxAttempts = 3;
+        const audioUrl = audioUrls[i];
+        const rawVideoPath = path.join(jobDir, `raw_v_${i}.mp4`);
+        const rawAudioPath = path.join(jobDir, `raw_a_${i}.wav`);
+        const sceneOutputPath = path.join(jobDir, `scene_${i}.mp4`);
 
-        while (!downloaded && attempts < maxAttempts) {
-          attempts++;
-          try {
-            console.log(`[Merge] Downloading video ${i} (Attempt ${attempts}): ${videoUrl}`);
-            const response = await axios({
-              method: "get",
-              url: videoUrl,
-              responseType: "stream",
-              timeout: 30000,
-              headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-              }
-            });
-            
-            const writer = fs.createWriteStream(localPath);
-            response.data.pipe(writer);
-            await new Promise<void>((resolve, reject) => {
-              writer.on("finish", () => resolve());
-              writer.on("error", reject);
-            });
-            downloaded = true;
-            localPaths.push(localPath);
-          } catch (err: any) {
-            console.error(`[Merge] Download attempt ${attempts} failed for video ${i}:`, err.message);
-            if (attempts >= maxAttempts) {
-              console.log(`[Merge] Skipping video ${i} after ${maxAttempts} failed attempts.`);
-            } else {
-              await new Promise(r => setTimeout(r, 2000)); // Wait before retry
-            }
-          }
+        // 1. Download Video
+        console.log(`[Merge] Downloading video ${i}: ${videoUrl}`);
+        const vResponse = await axios({ method: "get", url: videoUrl, responseType: "stream", timeout: 30000, headers: { 'User-Agent': 'Mozilla/5.0' } });
+        const vWriter = fs.createWriteStream(rawVideoPath);
+        vResponse.data.pipe(vWriter);
+        await new Promise<void>((resolve, reject) => { vWriter.on("finish", () => resolve()); vWriter.on("error", reject); });
+
+        // 2. Download Audio
+        console.log(`[Merge] Downloading audio ${i}`);
+        if (audioUrl.startsWith('data:')) {
+          const base64Data = audioUrl.split(',')[1];
+          fs.writeFileSync(rawAudioPath, Buffer.from(base64Data, 'base64'));
+        } else {
+          const aResponse = await axios({ method: "get", url: audioUrl, responseType: "stream", timeout: 30000 });
+          const aWriter = fs.createWriteStream(rawAudioPath);
+          aResponse.data.pipe(aWriter);
+          await new Promise<void>((resolve, reject) => { aWriter.on("finish", () => resolve()); aWriter.on("error", reject); });
         }
-      }
 
-      if (localPaths.length === 0) {
-        throw new Error("Failed to download any videos for merging.");
-      }
+        // 3. Get Audio Duration
+        const duration = await new Promise<number>((resolve, reject) => {
+          ffmpeg.ffprobe(rawAudioPath, (err, metadata) => {
+            if (err) reject(err);
+            else resolve(metadata.format.duration || 0);
+          });
+        });
+        console.log(`[Merge] Scene ${i} duration: ${duration}s`);
 
-      // 2. Normalize each video (Scale to 720x1280, 30fps, same codec)
-      console.log(`[Merge] Normalizing videos...`);
-      for (let i = 0; i < localPaths.length; i++) {
-        const inputPath = localPaths[i];
-        const outputPath = path.join(jobDir, `norm_${i}.mp4`);
-        
+        // 4. Process Scene (Loop video to match audio, mute video, add audio)
         await new Promise<void>((resolve, reject) => {
-          ffmpeg(inputPath)
+          ffmpeg(rawVideoPath)
+            .inputOptions(['-stream_loop', '-1']) // Loop video infinitely
+            .input(rawAudioPath)
             .outputOptions([
-              '-vf', 'scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,setsar=1',
+              '-vf', 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,unsharp=3:3:1.2:3:3:1.2',
+              '-sws_flags', 'lanczos',
               '-r', '30',
               '-c:v', 'libx264',
-              '-preset', 'ultrafast',
-              '-crf', '23',
+              '-preset', 'fast',
+              '-crf', '18',
               '-c:a', 'aac',
-              '-ar', '44100'
+              '-map', '0:v:0', // Take video from first input
+              '-map', '1:a:0', // Take audio from second input
+              '-shortest',     // End when the shortest stream ends (which is the audio because video loops)
+              '-t', duration.toString() // Explicitly set duration just in case
             ])
-            .on('error', (err) => {
-              console.error(`[Merge] Normalization error for video ${i}:`, err);
-              reject(err);
-            })
-            .on('end', () => {
-              console.log(`[Merge] Normalized video ${i}`);
-              resolve();
-            })
-            .save(outputPath);
+            .on('error', reject)
+            .on('end', () => resolve())
+            .save(sceneOutputPath);
         });
-        normalizedPaths.push(outputPath);
+        scenePaths.push(sceneOutputPath);
       }
 
-      // 3. Merge normalized videos
-      console.log(`[Merge] Concatenating normalized videos...`);
+      // 5. Concatenate all scenes
+      console.log(`[Merge] Concatenating ${scenePaths.length} scenes...`);
       const outputFilename = `final_short_${jobId}.mp4`;
       const finalOutputPath = path.join(jobDir, outputFilename);
 
       const mergeCommand = ffmpeg();
-      normalizedPaths.forEach(p => mergeCommand.input(p));
+      scenePaths.forEach(p => mergeCommand.input(p));
 
       await new Promise<void>((resolve, reject) => {
         mergeCommand
-          .on('start', (cmd) => console.log('[Merge] Ffmpeg merge command:', cmd))
-          .on('error', (err) => {
-            console.error('[Merge] Ffmpeg merge error:', err);
-            reject(err);
-          })
-          .on('end', () => {
-            console.log('[Merge] Successfully created final video');
-            resolve();
-          })
+          .on('error', reject)
+          .on('end', () => resolve())
           .mergeToFile(finalOutputPath, jobDir);
       });
 
